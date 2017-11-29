@@ -25,6 +25,7 @@
 #include "hphp/runtime/vm/native-prop-handler.h"
 
 #include "mysql.h"
+#include "hphp/runtime/vm/yastopwatch.h"
 
 namespace HPHP {
 
@@ -285,10 +286,17 @@ static bool HHVM_METHOD(mysqli, hh_real_connect, const Variant& server,
   }
 }
 
+extern struct __stopwatch__ __SW(db_query);
+extern enum __stopwatch__source__ __SOURCE(db_query);
+extern enum __stopwatch__type__ __TYPE(db_query); 
+
 static Variant HHVM_METHOD(mysqli, hh_real_query, const String& query) {
+  START_SW(db_query);
   auto res = get_connection_resource(this_);
   VALIDATE_RESOURCE(res, MySQLState::CONNECTED)
-  return php_mysql_do_query(query, res, false);
+  auto ret = php_mysql_do_query(query, res, false);
+  STOP_SW(db_query);
+  return ret;
 }
 
 static Variant HHVM_METHOD(mysqli, hh_server_version) {

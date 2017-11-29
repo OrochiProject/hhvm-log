@@ -45,6 +45,8 @@
 #include "hphp/runtime/base/config.h"
 #include "hphp/runtime/base/apc-file-storage.h"
 
+#include "hphp/runtime/ext/std/ext_std_variable.h"
+
 using HPHP::ScopedMem;
 
 namespace HPHP {
@@ -192,6 +194,12 @@ void apcExtension::moduleInit() {
   HHVM_FE(apc_store_as_primed_do_not_use);
   HHVM_FE(apc_fetch);
   HHVM_FE(apc_delete);
+  HHVM_FE(set_site_root); // cheng-hack
+  HHVM_FE(get_site_root_length); // cheng-hack
+  HHVM_FE(gen_site_root_placeholder); // cheng-hack
+  HHVM_FE(apc_store_logging); // cheng-hack
+  HHVM_FE(apc_fetch_logging); // cheng-hack
+  HHVM_FE(apc_delete_logging); // cheng-hack
   HHVM_FE(apc_clear_cache);
   HHVM_FE(apc_inc);
   HHVM_FE(apc_dec);
@@ -271,6 +279,8 @@ Variant HHVM_FUNCTION(apc_store,
   apc_store().set(strKey, var, ttl);
   return Variant(true);
 }
+
+
 
 /**
  * Stores the key in a similar fashion as "priming" would do (no TTL limit).
@@ -455,6 +465,125 @@ Variant HHVM_FUNCTION(apc_exists,
   return apc_store().exists(key.toString());
 }
 
+//============================================
+// cheng-hack: apc_store with lock and loggin 
+
+extern std::mutex stupid_apc_mtx;
+extern std::string apc_log_path;
+
+void write2apclog(std::string log_entry) {
+  // start to log
+  std::ofstream ofs;
+  // append, don't worry, we are in the critical section
+  ofs.open(apc_log_path, std::ofstream::out | std::ofstream::app);
+  ofs << log_entry;
+  ofs.close();
+}
+
+void write2apcdebug(int rid, int opnum, std::string action, 
+                    std::string key, std::string val) {
+  // start to log
+  std::ofstream ofs;
+  // append, don't worry, we are in the critical section
+  ofs.open("/tmp/concurrency_debug_apc", std::ofstream::out | std::ofstream::app);
+  ofs << "[" << rid << "-" << opnum << "] ";
+  val = val.substr(0,20);
+  boost::replace_all(val, "\r\n", "");
+  if (action == "store") {
+    ofs << key << " <= " << val << "  [store]\n";
+  } else if (action == "fetch") {
+    ofs << key << " => " << val << "  [fetch]\n";
+  } else if (action == "delete") {
+    ofs << key << " [delete]\n";
+  } else {
+    ofs << "WTF??? " << action << "\n";
+  }
+  ofs.close();
+}
+
+extern thread_local std::string site_root;
+static const std::string root_symbol = "#SITE_ROOT#";
+static const int root_symbol_len = 11;
+
+void HHVM_FUNCTION(set_site_root, const String& root) {
+  site_root = root.toCppString(); 
+}
+
+int HHVM_FUNCTION(get_site_root_length) {
+  // len(#SITE_ROOT#) = 10 
+  cheng_assert(site_root.length() >= root_symbol_len);
+  return site_root.length();
+}
+
+String HHVM_FUNCTION(gen_site_root_placeholder, const int len) {
+  cheng_assert(len > 10);
+  std::string ret = root_symbol + std::string(len-root_symbol_len, '#');
+  return String(ret.c_str());
+}
+
+Variant HHVM_FUNCTION(apc_store_logging,
+                      const Variant& key_or_array,
+                      const Variant& var /* = null */,
+                      int64_t ttl /* = 0 */,
+                      int64_t req_no, int64_t op_num) {
+  // some assumptions
+  cheng_assert(ttl==0);
+  cheng_assert(is_string(key_or_array));
+
+  stupid_apc_mtx.lock();
+  auto ret = HHVM_FN(apc_store)(key_or_array, var, ttl);
+  auto str_ret = ret.asBooleanVal() ? "1" : "0";
+  auto str_val = HHVM_FN(serialize)(var);
+
+  std::string log_entry = std::to_string(req_no) + "#&#" + std::to_string(op_num) + "#&#" +
+      "store#&#" + key_or_array.toString().toCppString() + "#&#" + str_val.toCppString()
+      + "#&#" + "0" /*ttl*/ + "#&#" + str_ret + "]&#]";
+  // start to log
+  write2apclog(log_entry);
+  //write2apcdebug(req_no, op_num, "store", key_or_array.toString().toCppString(), str_val.toCppString());
+
+  stupid_apc_mtx.unlock();
+  return ret;
+}
+
+Variant HHVM_FUNCTION(apc_delete_logging,
+                      const Variant& key,
+                      int64_t req_no, int64_t op_num) {
+  cheng_assert(is_string(key));
+
+  stupid_apc_mtx.lock();
+  auto ret = HHVM_FN(apc_delete)(key);
+  auto str_ret = ret.asBooleanVal() ? "1" : "0";
+  std::string log_entry = std::to_string(req_no) + "#&#" + std::to_string(op_num) + "#&#" +
+      "delete#&#" + key.toString().toCppString() + "#&#" + str_ret + "]&#]";
+  // start to log
+  write2apclog(log_entry);
+  //write2apcdebug(req_no, op_num, "delete", key.toString().toCppString(), "");
+
+  stupid_apc_mtx.unlock();
+  return ret;
+}
+
+Variant HHVM_FUNCTION(apc_fetch_logging,
+                      const Variant& key,
+                      VRefParam success /* = null */,
+                      int64_t req_no, int64_t op_num) {
+  cheng_assert(is_string(key));
+
+  stupid_apc_mtx.lock();
+  auto ret = HHVM_FN(apc_fetch)(key, success);
+  std::string log_entry = std::to_string(req_no) + "#&#" + std::to_string(op_num) + "#&#" +
+      "fetch#&#" + key.toString().toCppString() + "]&#]";
+  // start to log
+  write2apclog(log_entry);
+  //write2apcdebug(req_no, op_num, "fetch", key.toString().toCppString(), ret.toString().toCppString());
+
+  stupid_apc_mtx.unlock();
+  return ret;
+}
+
+
+//============================================
 
 const StaticString s_user("user");
 const StaticString s_start_time("start_time");

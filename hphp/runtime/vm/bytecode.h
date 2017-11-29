@@ -37,6 +37,13 @@
 namespace HPHP {
 struct Resumable;
 
+// cheng-hack:
+extern void cheng_fail(std::string file, int line);
+#define cheng_assert(cond) \
+  if (UNLIKELY(!(cond))) {\
+    cheng_fail(__FILE__, __LINE__);\
+  }
+
 /**
  * These macros allow us to easily change the arguments to iop*() opcode
  * implementations.

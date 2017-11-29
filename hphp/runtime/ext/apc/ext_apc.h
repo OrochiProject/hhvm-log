@@ -68,6 +68,28 @@ class apcExtension final : public Extension {
 };
 
 ///////////////////////////////////////////////////////////////////////////////
+
+//cheng-hack
+void HHVM_FUNCTION(set_site_root, const String& root);
+int HHVM_FUNCTION(get_site_root_length);
+String HHVM_FUNCTION(gen_site_root_placeholder, const int len);
+
+// cheng-hack
+Variant HHVM_FUNCTION(apc_store_logging,
+                      const Variant& key_or_array,
+                      const Variant& var = null_variant,
+                      int64_t ttl = 0,
+                      int64_t req_no=0, int64_t op_num=0);
+// cheng-hack
+Variant HHVM_FUNCTION(apc_delete_logging,
+                      const Variant& key,
+                      int64_t req_no, int64_t op_num);
+//cheng-hack
+Variant HHVM_FUNCTION(apc_fetch_logging,
+                      const Variant& key,
+                      VRefParam success = uninit_null(),
+                      int64_t req_no=0, int64_t op_num=0);
+
 Variant HHVM_FUNCTION(apc_add,
                       const Variant& key_or_array,
                       const Variant& var = null_variant,

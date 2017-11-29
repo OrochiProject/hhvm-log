@@ -15,6 +15,11 @@
 */
 #include "hphp/runtime/vm/bytecode.h"
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <error.h>
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -106,6 +111,9 @@
 #include "hphp/runtime/ext/ext_collections.h"
 
 #include "hphp/runtime/vm/globals-array.h"
+#include "atomic"
+#include "hphp/runtime/vm/yastopwatch.h"
+#include <time.h>
 
 namespace HPHP {
 
@@ -121,6 +129,235 @@ const bool skipCufOnInvalidParams = false;
 bool RuntimeOption::RepoAuthoritative = false;
 
 using jit::mcg;
+
+// cheng-hack:
+//#define CHENG_DEBUG
+#define CHENG_TIME_EVAL
+//#define CHENG_INS_ONLY_DEBUG
+
+// lock for all the shared logs
+std::mutex t_mtx;
+
+DEF_SW(db_query);
+
+#ifdef CHENG_TIME_EVAL
+thread_local struct timeval vm_start_t;
+DEF_TSC_SW(c_ins_time);
+DEF_SW(ins_time);
+
+#define START START_SW(c_ins_time)
+#define END   STOP_SW(c_ins_time)
+
+/*
+#define START \
+  do {\
+    START_SW(ins_time);\
+    START_SW(c_ins_time);\
+  } while(0)
+
+#define END  \
+  do {\
+    STOP_SW(c_ins_time);\
+    STOP_SW(ins_time);\
+  } while(0)
+*/
+
+#else
+
+#define START (void(0))
+#define END   (void(0)) 
+
+#endif
+
+void cheng_fail(std::string file, int line) {
+  std::cout << "***FAIL*** on file: " << file << " loc: " << line << "\n";
+  always_assert(false);
+}
+
+thread_local bool is_resource_req = false;
+bool cheng_replay = false;
+
+std::atomic<int>  glb_reqcounter(0);
+static int64_t prime = 179424691L;
+
+thread_local uint64_t hash;
+thread_local int cheng_reqcounter;
+thread_local std::stringstream envbuf;
+
+thread_local bool first_pop; // FIXME: used for not being affected by end-hook in php
+thread_local std::stringstream cheng_output_buf;
+
+thread_local bool cf_esacpe = false;
+
+thread_local std::string site_root;
+
+//static void print_ins (std::string name);
+static void addIntoHash(int op) {
+  if (!cf_esacpe) {
+    //print_ins("jmp"+std::to_string(op));
+    hash = hash*prime + op;
+  }
+}
+
+
+void
+write2log(std::string msg) {
+#ifdef CHENG_DEBUG
+  t_mtx.lock();
+  static std::ofstream of("/tmp/hhvmt_info.log");
+  of << "[" << cheng_reqcounter << "] " << msg << "\n";
+  of.flush();
+  t_mtx.unlock();
+#endif
+}
+
+void
+dumpToFile() {
+  // write to /tmp/cf_tags.log
+  std::ofstream cfout;
+  t_mtx.lock();
+  cfout.open("/tmp/cf_tags.log", std::ofstream::out | std::ofstream::app);
+  cfout << "r" << cheng_reqcounter << ":" << hash << ";";
+  cfout.close();
+  t_mtx.unlock();
+
+  write2log("hash: " + std::to_string(hash));
+  if (cheng_replay) {
+    return;
+  }
+}
+
+//==============INS_DEBUG=================
+
+#ifdef CHENG_INS_ONLY_DEBUG 
+thread_local std::ofstream debug_log;
+thread_local int ins_counter = 0;
+#endif
+
+static void
+openDebugLog() {
+#ifdef CHENG_INS_ONLY_DEBUG 
+  debug_log.rdbuf()->pubsetbuf(0,0);
+  //debug_log.open("/tmp/debug.log");
+  debug_log.open("/tmp/online_debug/debug_"+std::to_string(cheng_reqcounter)+".log");
+#endif
+}
+
+static void
+closeDebugLog() {
+#ifdef CHENG_INS_ONLY_DEBUG 
+  debug_log.close();
+#endif
+}
+
+static inline void print_ins (std::string name) {
+#ifdef CHENG_INS_ONLY_DEBUG
+  if (cheng_reqcounter >= 0) {
+    debug_log << "=-= [" << ins_counter << "] " << name;
+    auto func = vmfp()->m_func;
+    if (func!=nullptr) {
+      debug_log <<  "     (" << func->fullName()->toCppString() << ")";
+    }
+    auto vm = &*g_context;
+    if (vm!=nullptr) { 
+      debug_log << "  { " << vm->getContainingFileName()->toCppString()
+        << " : " << vm->getLine() << "}";
+    }
+    //debug_log << " HASH[" << hash << "]"; 
+    debug_log << " =-=\n";
+  }
+#endif
+} 
+
+//============APC lock&logging=============
+// This is a stupid lock for concurrency APC
+std::mutex stupid_apc_mtx;
+std::string apc_log_path("/tmp/apc.log");
+std::map<std::string, std::shared_ptr<std::mutex> > naive_native_locks;
+
+// will abort if exceed this threshold,
+// in which case, most likely there is one request forget to release the lock 
+int try_lock_threshold = 100;
+
+// Naive implementation, will block, take care
+void naive_native_lock_acquire(std::string lock_name) {
+  if (naive_native_locks.find(lock_name) == naive_native_locks.end()) {
+    std::shared_ptr<std::mutex> m = std::make_shared<std::mutex>();
+    naive_native_locks.emplace(lock_name, m);
+  }
+  // BUG: Has a weird problem that log will crash
+  for (int i=0; i < try_lock_threshold; i++) {
+    if (naive_native_locks[lock_name]->try_lock()) {
+      return;
+    } else {
+      usleep(i*100); // XXX
+    }
+  }
+  // should never be here
+  cheng_assert(false);
+}
+
+void naive_native_lock_release(std::string lock_name) {
+  // assert the lock exists
+  cheng_assert(naive_native_locks.find(lock_name) != naive_native_locks.end());
+  naive_native_locks[lock_name]->unlock();
+}
+
+//==========Req start/end==============
+
+void thread_init() {
+  cheng_reqcounter = glb_reqcounter.fetch_add(1);
+  hash = 1;
+  envbuf.str("");
+  first_pop = true;
+  cheng_output_buf.str("");
+  // FIXME: we need to make sure this is reset to be false
+  is_resource_req = false;
+  cf_esacpe = false;
+  // debug
+  openDebugLog();
+}
+
+void thread_exit() {
+  // cheng-hack: FIXME:dump log to file, and dump output to file 
+  if (first_pop) {
+    dumpToFile();
+    first_pop = false;
+  }
+
+#ifdef CHENG_TIME_EVAL
+  struct timeval end;
+  gettimeofday(&end, NULL);
+  int64_t time = (end.tv_sec - vm_start_t.tv_sec) * 1000000 + (end.tv_usec - vm_start_t.tv_usec);
+  gettimeofday(&vm_start_t, NULL); // this can be called multiple times, like register_end
+  t_mtx.lock();
+  std::ofstream otf("/tmp/naive_replay/php_runtime.log", std::ofstream::app);
+  otf << time << ",";
+  otf.close();
+  std::ofstream otf1("/tmp/naive_replay/ins_time.log", std::ofstream::app);
+  otf1 << GET_TIME(ins_time) << "|" << GET_COUNT(ins_time) << "||" 
+    << GET_TIME(c_ins_time) << "|" << GET_COUNT(c_ins_time) << "\n" ;
+  otf1.close();
+  std::ofstream otf2("/tmp/naive_replay/db_time.log", std::ofstream::app);
+  otf2 << GET_TIME(db_query) << ",";
+  otf2.close();
+
+  // use clock to measure cpu time
+  {
+    double time_elapsed = (double)clock() / CLOCKS_PER_SEC * 1000;
+    std::ofstream otf3("/tmp/hhvmt_cpu_time.log", std::ofstream::app);
+    otf3 << time_elapsed << "\n";
+    otf3.close();
+  }
+
+  RESET_SW(db_query);
+  t_mtx.unlock();
+#endif
+
+  closeDebugLog();
+}
+
+//===============================
 
 #define IOP_ARGS        PC& pc
 #if DEBUG
@@ -596,6 +833,11 @@ Stack::requestInit() {
     RuntimeOption::EvalVMStackElms - sSurprisePageSize / sizeof(TypedValue);
   assert(!wouldOverflow(maxelms - 1));
   assert(wouldOverflow(maxelms));
+  // cheng-hack:
+  thread_init();
+#ifdef CHENG_TIME_EVAL
+  gettimeofday(&vm_start_t, NULL);
+#endif
 }
 
 void
@@ -4176,18 +4418,22 @@ OPTBLD_INLINE void jmpOpImpl(PC& pc) {
     if (op == OpJmpZ ? n == 0 : n != 0) {
       pc += offset - 1;
       vmStack().popX();
+      addIntoHash(1);
     } else {
       pc += sizeof(Offset);
       vmStack().popX();
+      addIntoHash(2);
     }
   } else {
     auto const condition = toBoolean(cellAsCVarRef(*c1));
     if (op == OpJmpZ ? !condition : condition) {
       pc += offset - 1;
       vmStack().popC();
+      addIntoHash(3);
     } else {
       pc += sizeof(Offset);
       vmStack().popC();
+      addIntoHash(4);
     }
   }
 }
@@ -4220,6 +4466,7 @@ OPTBLD_INLINE void iopIterBreak(IOP_ARGS) {
     }
   }
   pc = savedPc + offset;
+  addIntoHash(6);
 }
 
 enum class SwitchMatch {
@@ -4342,14 +4589,17 @@ OPTBLD_INLINE void iopSwitch(IOP_ARGS) {
         case SwitchMatch::NORMAL:
         case SwitchMatch::DEFAULT:
           pc = origPC + jmptab[veclen - 1];
+          addIntoHash((veclen-1)*10);
           break;
 
         case SwitchMatch::NONZERO:
           pc = origPC + jmptab[veclen - 2];
+          addIntoHash((veclen-2)*10);
           break;
       }
     } else {
       pc = origPC + jmptab[intval - base];
+      addIntoHash((intval-base)*10);
     }
   }
 }
@@ -4379,6 +4629,7 @@ OPTBLD_INLINE void iopSSwitch(IOP_ARGS) {
     pc = origPC + jmptab[veclen-1].dest;
   }
   vmStack().popC();
+  addIntoHash(5);
 }
 
 OPTBLD_INLINE void ret(PC& pc) {
@@ -4648,11 +4899,13 @@ OPTBLD_INLINE void iopCGetS(IOP_ARGS) {
 
 OPTBLD_INLINE void iopCGetM(IOP_ARGS) {
   pc++;
+  START;
   MemberState mstate;
   auto tvRet = getHelper(pc, mstate);
   if (tvRet->m_type == KindOfRef) {
     tvUnbox(tvRet);
   }
+  END;
 }
 
 static inline void vgetl_body(TypedValue* fr, TypedValue* to) {
@@ -6322,6 +6575,7 @@ OPTBLD_INLINE void iopIterInit(IOP_ARGS) {
   if (initIterator(pc, origPc, it, offset, c1)) {
     tvAsVariant(tv1) = it->arr().second();
   }
+  addIntoHash(7);
 }
 
 OPTBLD_INLINE void iopIterInitK(IOP_ARGS) {
@@ -6339,6 +6593,7 @@ OPTBLD_INLINE void iopIterInitK(IOP_ARGS) {
     tvAsVariant(tv1) = it->arr().second();
     tvAsVariant(tv2) = it->arr().first();
   }
+  addIntoHash(8);
 }
 
 OPTBLD_INLINE void iopWIterInit(IOP_ARGS) {
@@ -6353,6 +6608,7 @@ OPTBLD_INLINE void iopWIterInit(IOP_ARGS) {
   if (initIterator(pc, origPc, it, offset, c1)) {
     tvAsVariant(tv1).setWithRef(it->arr().secondRef());
   }
+  addIntoHash(9);
 }
 
 OPTBLD_INLINE void iopWIterInitK(IOP_ARGS) {
@@ -6370,6 +6626,7 @@ OPTBLD_INLINE void iopWIterInitK(IOP_ARGS) {
     tvAsVariant(tv1).setWithRef(it->arr().secondRef());
     tvAsVariant(tv2) = it->arr().first();
   }
+  addIntoHash(10);
 }
 
 
@@ -6435,6 +6692,7 @@ OPTBLD_INLINE void iopIterNext(IOP_ARGS) {
     pc = origPc + offset;
     tvAsVariant(tv1) = it->arr().second();
   }
+  addIntoHash(11);
 }
 
 OPTBLD_INLINE void iopIterNextK(IOP_ARGS) {
@@ -6453,6 +6711,7 @@ OPTBLD_INLINE void iopIterNextK(IOP_ARGS) {
     tvAsVariant(tv1) = it->arr().second();
     tvAsVariant(tv2) = it->arr().first();
   }
+  addIntoHash(12);
 }
 
 OPTBLD_INLINE void iopWIterNext(IOP_ARGS) {
@@ -7473,6 +7732,37 @@ void dispatchImpl() {
   PC pc = vmpc();
   DISPATCH();
 
+#ifdef CHENG_INS_ONLY_DEBUG_NEVER
+
+#define O(name, imm, push, pop, flags)                        \
+  LabelDbg##name:                                             \
+    phpDebuggerOpcodeHook(pc);                                \
+  LabelCover##name:                                           \
+    if (collectCoverage) {                                    \
+      recordCodeCoverage(pc);                                 \
+    }                                                         \
+  Label##name: {                                              \
+    print_ins(#name);\
+    iop##name(pc);                                            \
+    vmpc() = pc;                                              \
+    if (breakOnCtlFlow) {                                     \
+      isCtlFlow = instrIsControlFlow(Op::name);               \
+      Stats::incOp(Op::name);                                 \
+    }                                                         \
+    if (UNLIKELY(!pc)) {                                      \
+      DEBUG_ONLY const Op op = Op::name;                      \
+      assert(op == OpRetC || op == OpRetV ||                  \
+             op == OpAwait || op == OpCreateCont ||           \
+             op == OpYield || op == OpYieldK ||               \
+             op == OpNativeImpl);                             \
+      vmfp() = nullptr;                                       \
+      return;                                                 \
+    }                                                         \
+    DISPATCH();                                               \
+  }
+
+#else
+
 #define O(name, imm, push, pop, flags)                        \
   LabelDbg##name:                                             \
     phpDebuggerOpcodeHook(pc);                                \
@@ -7498,6 +7788,8 @@ void dispatchImpl() {
     }                                                         \
     DISPATCH();                                               \
   }
+#endif
+
   OPCODES
 #undef O
 #undef DISPATCH
@@ -7682,6 +7974,8 @@ void ExecutionContext::requestExit() {
   }
 
   if (Logger::UseRequestLog) Logger::SetThreadHook(nullptr, nullptr);
+
+  thread_exit();
 }
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -92,6 +92,28 @@ function get_resource_type(resource $handle): string;
 <<__Native>>
 function boolval(mixed $var): bool;
 
+// cheng-hack:
+<<__Native>>
+function naive_native_lock(string $lock_name): void;
+<<__Native>>
+function naive_native_unlock(string $lock_name): void;
+<<__Native>>
+function get_req_no(): int;
+<<__Native>>
+function get_cf_hash(): string;
+<<__Native>>
+function is_cf_escape(): bool;
+<<__Native>>
+function set_cf_escape(bool $escape): void;
+<<__Native>>
+function is_res_req(): bool;
+<<__Native>>
+function set_res_req(bool $is_res): void;
+<<__Native>>
+function cheng_dump_output(string $path): void;
+<<__Native>>
+function is_replay(): bool;
+
 /* Returns the integer value of var, using the specified base for the
  * conversion (the default is base 10). intval() should not be used on
  * objects, as doing so will emit an E_NOTICE level error and return 1.

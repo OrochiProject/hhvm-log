@@ -26,6 +26,7 @@
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/server/http-protocol.h"
 
+#include "fstream"
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -55,6 +56,68 @@ String HHVM_FUNCTION(get_resource_type, const Resource& handle) {
 
 bool HHVM_FUNCTION(boolval, const Variant& v) {
   return v.toBoolean();
+}
+
+// cheng-hack:
+extern thread_local int cheng_reqcounter;
+int64_t HHVM_FUNCTION(get_req_no) {
+  return cheng_reqcounter;
+}
+
+extern void naive_native_lock_acquire(std::string lockname);
+extern void naive_native_lock_release(std::string lockname);
+
+void HHVM_FUNCTION(naive_native_lock, const String& lname) {
+  naive_native_lock_acquire(lname.toCppString());
+}
+void HHVM_FUNCTION(naive_native_unlock, const String& lname) {
+  naive_native_lock_release(lname.toCppString());
+}
+
+extern thread_local bool cf_esacpe;
+void HHVM_FUNCTION(set_cf_escape, bool escape) {
+  cf_esacpe = escape;
+}
+
+bool HHVM_FUNCTION(is_cf_escape) {
+  return cf_esacpe;
+}
+
+extern thread_local uint64_t hash;
+String HHVM_FUNCTION(get_cf_hash) {
+  return std::to_string(hash);
+}
+
+extern thread_local bool is_resource_req;
+void HHVM_FUNCTION(set_res_req, bool is_res) {
+  is_resource_req = is_res;
+}
+
+bool HHVM_FUNCTION(is_res_req) {
+  return is_resource_req;
+}
+
+extern bool cheng_replay;
+extern thread_local std::stringstream cheng_output_buf;
+void HHVM_FUNCTION(cheng_dump_output, const Variant& v) {
+  // we ignore resource requests
+  if (is_resource_req) return;
+
+  if (cheng_output_buf.str() == "") {
+    // this means even almost end, the cheng_output_buf is not charged
+    // we need the m_sb in the buffer.
+    auto content = g_context->obCopyContents();
+    cheng_output_buf << content.toCppString();
+  }
+
+  std::ofstream of;
+  of.open(v.toCStrRef().toCppString());
+  of << cheng_output_buf.str();
+  of.close();
+}
+
+bool HHVM_FUNCTION(is_replay) {
+  return cheng_replay;
 }
 
 int64_t HHVM_FUNCTION(intval, const Variant& v, int64_t base /* = 10 */) {
@@ -447,6 +510,16 @@ void StandardExtension::initVariable() {
   HHVM_FE(is_object);
   HHVM_FE(is_resource);
   HHVM_FE(boolval);
+  HHVM_FE(set_cf_escape); //cheng-hack
+  HHVM_FE(is_cf_escape); //cheng-hack
+  HHVM_FE(naive_native_lock); //cheng-hack
+  HHVM_FE(naive_native_unlock); //cheng-hack
+  HHVM_FE(get_cf_hash); //cheng-hack
+  HHVM_FE(get_req_no); //cheng-hack
+  HHVM_FE(is_res_req); //cheng-hack
+  HHVM_FE(set_res_req); //cheng-hack
+  HHVM_FE(is_replay);
+  HHVM_FE(cheng_dump_output);
   HHVM_FE(intval);
   HHVM_FE(floatval);
   HHVM_FALIAS(doubleval, floatval);

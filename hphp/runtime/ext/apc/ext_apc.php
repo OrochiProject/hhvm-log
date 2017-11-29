@@ -53,6 +53,19 @@ function apc_add(mixed $key_or_array,
 function apc_store(mixed $key_or_array,
                    mixed $var = null,
                    int $ttl = 0): mixed;
+// cheng-hack:
+<<__Native>>
+function apc_store_logging(mixed $key_or_array,
+                   mixed $var = null,
+                   int $ttl = 0, int $req_no=0, int $op_num=0): mixed;
+
+// cheng-hack
+<<__Native>>
+function set_site_root(string $root) : void;
+<<__Native>>
+function get_site_root_length() : int;
+<<__Native>>
+function gen_site_root_placeholder(int $len) : string;
 
 /**
  * Simlar to apc_store() but TTL is always 0 and there is TTL cap applied. Do
@@ -84,6 +97,10 @@ function apc_store_as_primed_do_not_use(string $key,
 <<__Native>>
 function apc_fetch(mixed $key,
                    mixed &$success = null): mixed;
+// cheng-hack
+<<__Native>>
+function apc_fetch_logging(mixed $key,
+                   mixed &$success = null, int $req_no=0, int $op_num=0): mixed;
 
 /**
  * Removes a stored variable from the cache.
@@ -95,6 +112,9 @@ function apc_fetch(mixed $key,
  */
 <<__Native>>
 function apc_delete(mixed $key): mixed;
+// cheng-hack:
+<<__Native>>
+function apc_delete_logging(mixed $key, int $req_no=0, int $op_num=0): mixed;
 
 /**
  * Retrieves cached information and meta-data from APC's data store.

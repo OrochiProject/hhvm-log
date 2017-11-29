@@ -37,6 +37,17 @@ bool HHVM_FUNCTION(is_resource, const Variant& v);
 String HHVM_FUNCTION(gettype, const Variant& v);
 String HHVM_FUNCTION(get_resource_type, const Resource& handle);
 
+// cheng-hack:
+int64_t HHVM_FUNCTION(get_req_no);
+String HHVM_FUNCTION(get_cf_hash);
+bool HHVM_FUNCTION(is_cf_escape);
+void HHVM_FUNCTION(naive_native_lock, const String& lock_name);
+void HHVM_FUNCTION(naive_native_unlock, const String& lock_name);
+void HHVM_FUNCTION(set_cf_escape, bool escape);
+bool HHVM_FUNCTION(is_replay);
+bool HHVM_FUNCTION(is_res_req);
+void HHVM_FUNCTION(set_res_req, bool is_req);
+void HHVM_FUNCTION(cheng_dump_output, const Variant& v);
 ///////////////////////////////////////////////////////////////////////////////
 // type conversion
 
